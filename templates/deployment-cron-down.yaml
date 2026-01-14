@@ -1,0 +1,14 @@
+{{- if .Values.argocd.enabled }}
+{{- if and (gt (int .Values.odooinit.workers) 0) (gt (int .Values.odooinit.cronThreads) 0) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "odoo.fullname" . }}-cron
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+  annotations:
+    "argocd.argoproj.io/sync-wave": "-23"
+spec:
+  replicas: 0
+{{- end }}
+{{- end }}

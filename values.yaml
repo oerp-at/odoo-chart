@@ -108,3 +108,5 @@ tolerations: []
 
 affinity: {}
 
+argocd:
+  enabled: false
