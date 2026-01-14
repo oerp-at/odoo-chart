@@ -24,6 +24,7 @@ pgPassword: ""
 pgAdminUser: ""
 pgAdminPassword: ""
 queue: false
+setup: false
 
 # update
 update:
