@@ -109,4 +109,6 @@ sessionstore:
   size: 1Gi
   storageClassName: "default"
 
+argocd:
+  enabled: false
 
