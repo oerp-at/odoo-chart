@@ -6,14 +6,14 @@ metadata:
   labels:
     {{- include "odoo.labels" . | nindent 4 }}
 spec:
-  schedule: {{ .Values.backupSchedule }}
-  {{- if .Values.backupTimezone }}
-  timeZone: "{{ .Values.backupTimezone }}"
+  schedule: {{ .Values.backup.schedule }}
+  {{- if .Values.backup.timezone }}
+  timeZone: "{{ .Values.backup.timezone }}"
   {{- end }}
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
-      backoffLimit: {{ .Values.backupBackoffLimit }}
+      backoffLimit: {{ .Values.backup.backoffLimit }}
       template:
         metadata:
           labels:

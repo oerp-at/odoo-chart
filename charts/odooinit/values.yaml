@@ -42,12 +42,13 @@ restore:
 # backup
 backup:
   enabled: false
-  path: ''
+  path: ""
   backlog: 6
   onlyDatabase: false
-  schedule: ''
+  schedule: ""
   backoffLimit: 0
   volumeClaim: ""
+  timezone: ""
 
 image:
   repository: odoo
