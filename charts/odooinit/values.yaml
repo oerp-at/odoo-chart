@@ -130,4 +130,5 @@ argocd:
   appName: ""
   namespace: argocd
   setupParam: "odoo.odooinit.setup"
+  serviceAccount: ""
 
