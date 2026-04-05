@@ -94,13 +94,13 @@ spec:
                 kubectl scale deployment "$DEPLOY" --replicas=0 -n "$NS"
                 WAITED=0
                 while [ "$WAITED" -lt "$TIMEOUT" ]; do
-                  REPLICAS=$(kubectl get deployment "$DEPLOY" -n "$NS" \
-                    -o jsonpath='{.status.replicas}' 2>/dev/null || true)
-                  [ -z "$REPLICAS" ] || [ "$REPLICAS" = "0" ] && {
-                    echo "$DEPLOY scaled down."
+                  REMAINING=$(kubectl get pods -n "$NS" --no-headers 2>/dev/null \
+                    | grep "^${DEPLOY}-" | wc -l)
+                  if [ "$REMAINING" -eq 0 ]; then
+                    echo "$DEPLOY scaled down, all pods terminated."
                     return 0
-                  }
-                  echo "  $DEPLOY: $REPLICAS replicas remaining ..."
+                  fi
+                  echo "  $DEPLOY: $REMAINING pods remaining ..."
                   sleep 3
                   WAITED=$((WAITED + 3))
                 done
