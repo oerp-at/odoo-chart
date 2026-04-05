@@ -1,4 +1,4 @@
- {{- if .Values.restore.enabled -}}
+ {{- if and .Values.restore.enabled (or (not .Values.argocd.enabled) .Values.setup) -}}
 apiVersion: batch/v1
 kind: Job
 metadata:

@@ -118,6 +118,16 @@ sessionstore:
   size: 1Gi
   storageClassName: "default"
 
+scaleDown:
+  enabled: true
+  timeout: 120
+  image:
+    repository: bitnami/kubectl
+    tag: latest
+
 argocd:
   enabled: false
+  appName: ""
+  namespace: argocd
+  setupParam: "odoo.odooinit.setup"
 
