@@ -92,8 +92,20 @@ spec:
                 }
                 echo "Scaling down $DEPLOY ..."
                 kubectl scale deployment "$DEPLOY" --replicas=0 -n "$NS"
-                kubectl rollout status deployment/"$DEPLOY" -n "$NS" --timeout="${TIMEOUT}s"
-                echo "$DEPLOY scaled down."
+                WAITED=0
+                while [ "$WAITED" -lt "$TIMEOUT" ]; do
+                  REMAINING=$(kubectl get pods -n "$NS" --no-headers 2>/dev/null \
+                    | grep "^${DEPLOY}-" | wc -l)
+                  if [ "$REMAINING" -eq 0 ]; then
+                    echo "$DEPLOY scaled down, all pods terminated."
+                    return 0
+                  fi
+                  echo "  Waiting for $REMAINING terminating pod(s) of $DEPLOY ..."
+                  sleep 3
+                  WAITED=$((WAITED + 3))
+                done
+                echo "Timeout waiting for pods of $DEPLOY to terminate."
+                return 1
               }
 
               FULLNAME="{{ include "odoo.fullname" . }}"
