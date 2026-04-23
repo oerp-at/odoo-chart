@@ -33,7 +33,7 @@ update:
 
 # restore
 restore:
-  enabled: false
+  enabled: true
   onUpdate: false
   installModule: ""
   filestorePath: ""
