@@ -128,6 +128,83 @@ Dreistufig:
 
 Defaults siehe [`values.yaml`](values.yaml). Der `startupProbe`-Default toleriert ca. 1 Stunde (`periodSeconds: 30`, `failureThreshold: 120`), damit auch im Safety-Net-Fall – Worker-Pod startet neu, während `ODOO_WAIT_FOR_RESTORE` noch auf einen langen Restore wartet – keine vorzeitige Liveness-Killung erfolgt. Im regulären Install-Flow ist der Marker bereits vor Worker-Start geschrieben und der Probe-Erfolg kommt nach Sekunden.
 
+## TLS via cert-manager und Ingress
+
+Die TLS-Konfiguration ist auf **Multi-Instance-Tauglichkeit im selben Namespace** ausgelegt. Drei Werte sind beteiligt:
+
+| Wert | Default | Effekt |
+|---|---|---|
+| `certmanager.secretName` | `""` (resolved zu `<release>-tls`) | Name des von cert-manager erzeugten TLS-Secrets UND der `Certificate`-Resource |
+| `ingress.tlsSecretName` | `""` (resolved via Helper) | Welcher TLS-Secret-Name in den Ingress-Spec eingetragen wird |
+| `ingressroute.tlsSecretName` | `""` (resolved via Helper) | Selbes für Traefik IngressRoute |
+
+Resolution-Cascade (Helper [`odoo.ingress.tlsSecretName`](charts/odooinit/templates/_helpers.tpl)):
+
+1. Wenn `ingress.tlsSecretName` explizit gesetzt -> verwendet diesen Wert
+2. Sonst wenn `certmanager.enabled: true` -> verwendet den cert-manager-Secret-Namen (default `<release>-tls`)
+3. Sonst leer -> Ingress wird ohne TLS-Block gerendert
+
+### Multi-Instance im selben Namespace
+
+Mehrere Releases (z. B. `odoo-staging` und `odoo-prod` oder zwei Mandanten) im selben Namespace funktionieren mit den Defaults out-of-the-box:
+
+| Release | TLS-Secret | Certificate-Name |
+|---|---|---|
+| `helm install odoo-staging ./odooi` | `odoo-staging-odoo-tls` | `odoo-staging-odoo-tls` |
+| `helm install odoo-prod ./odooi` | `odoo-prod-odoo-tls` | `odoo-prod-odoo-tls` |
+
+Keine Kollisionen, weder bei der Certificate-Resource noch beim Secret. Wenn ein Release `certmanager.secretName: shared-tls` setzt, wird dieser Wert verwendet und teilt das Secret bewusst mit anderen Releases (z. B. wenn ein gemeinsames Wildcard-Zertifikat für mehrere Mandanten genutzt wird).
+
+### Manuelle TLS-Secrets (ohne cert-manager)
+
+Wenn `certmanager.enabled: false`, kann `ingress.tlsSecretName` explizit gesetzt werden, um auf einen manuell verwalteten Secret zu zeigen:
+
+```yaml
+certmanager:
+  enabled: false
+ingress:
+  enabled: true
+  tlsSecretName: "wildcard-example-com"   # extern verwaltetes Secret
+```
+
+Bleibt `ingress.tlsSecretName` leer und cert-manager ist deaktiviert, wird das `tls`-Feld im Ingress-Manifest weggelassen (keine TLS-Termination am Ingress).
+
+### Migration von hardcoded `odoo-tls`
+
+Vor dieser Chart-Version war `odoo-tls` der hardcoded Default für sowohl `certmanager.secretName` als auch `ingress.tlsSecretName`. Beim Upgrade auf eine Release-spezifische Default-Auflösung passiert für bestehende Installationen Folgendes:
+
+- Die alte `Certificate`-Resource `odoo-tls` wird von Helm gelöscht (nicht mehr im Manifest)
+- Eine neue `Certificate`-Resource `<release>-odoo-tls` wird erzeugt
+- cert-manager beantragt ein neues Zertifikat -> kurze TLS-Downtime (bei Let's Encrypt typischerweise < 2 Min)
+
+Möchte man die Downtime vermeiden oder den alten Namen beibehalten, einfach explizit setzen:
+
+```yaml
+certmanager:
+  secretName: "odoo-tls"
+ingress:
+  tlsSecretName: "odoo-tls"   # nur sinnvoll bei genau EINER Instanz pro Namespace
+```
+
+### `commonName` ist nun opt-in
+
+`commonName` wird nicht mehr automatisch auf `hosts[0]` gesetzt. Cert-Manager hat das Feld seit v1.x als deprecated markiert, moderne CAs ignorieren es, und es bricht bei Hostnames > 64 Zeichen. Wer es trotzdem braucht (z. B. legacy SOAP-Clients), setzt:
+
+```yaml
+certmanager:
+  commonName: "odoo.example.com"
+```
+
+### Namespace-scoped Issuer
+
+Standard ist `issuerKind: ClusterIssuer`. Für namespace-scoped `Issuer`-Resources:
+
+```yaml
+certmanager:
+  issuer: "letsencrypt-staging-ns"
+  issuerKind: "Issuer"
+```
+
 ## Restore-Dauer und Timeouts
 
 Ein Restore kann je nach Datenbankgröße, Filestore-Volumen und Storage-Backend-Geschwindigkeit **bis zu einer Stunde oder länger** dauern. Drei Stellen sind davon betroffen und müssen aufeinander abgestimmt sein:
