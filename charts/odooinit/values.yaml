@@ -32,12 +32,16 @@ update:
   backoffLimit: 0
 
 # restore
+# activeDeadlineSeconds caps the restore Job runtime. Default 7200 (2h)
+# leaves a generous buffer for very large databases. Tune per instance
+# if dumps are smaller; raise for multi-TB filestores.
 restore:
   enabled: true
   onUpdate: false
   installModule: ""
   filestorePath: ""
   databasePath: ""
+  activeDeadlineSeconds: 7200
 
 # backup
 backup:

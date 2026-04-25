@@ -5,11 +5,27 @@
 replicaCount: 1
 maxCronReplicaCount: 1
 
+# odoo startup check. failureThreshold * periodSeconds defines the maximum
+# time the worker may take before liveness/readiness become active. The
+# default tolerates ~1 hour to cover the safety-net case where a worker
+# pod was restarted while a long-running restore (large database, slow
+# storage backend) is still in progress and ODOO_WAIT_FOR_RESTORE blocks
+# the server start. In the regular install flow the restore Job has
+# already completed before workers start, so the probe succeeds within
+# seconds.
+startupProbe:
+  enabled: true
+  path: '/web/health'
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 120
+
 # odoo live check
 livenessProbe:
   enabled: true
   path: '/web/health'
-  initialDelaySeconds: 600
+  initialDelaySeconds: 30
   periodSeconds: 30
   timeoutSeconds: 5
   failureThreshold: 6
@@ -19,7 +35,7 @@ livenessProbe:
 readinessProbe:
   enabled: true
   path: '/web/health'
-  initialDelaySeconds: 30
+  initialDelaySeconds: 10
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 6

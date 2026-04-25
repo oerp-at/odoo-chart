@@ -20,7 +20,7 @@ spec:
       {{- end }}
       labels:
         {{- include "odoo.labels" . | nindent 8 }}
-	{{- with .Values.podLabels }}
+        {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
@@ -36,8 +36,10 @@ spec:
           env:
             - name: ODOO_CONFIG
               value: "/data/etc/odoo-cron.conf"
+            {{- if .Values.odooinit.restore.enabled }}
             - name: ODOO_WAIT_FOR_RESTORE
               value: "1"
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.odooinit.image.repository }}:{{ .Values.odooinit.image.tag | default .Chart.AppVersion }}"
