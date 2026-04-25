@@ -12,6 +12,7 @@ spec:
   selector:
     matchLabels:
       {{- include "odoo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cron
   template:
     metadata:
       {{- with .Values.podAnnotations }}
@@ -20,6 +21,7 @@ spec:
       {{- end }}
       labels:
         {{- include "odoo.labels" . | nindent 8 }}
+        app.kubernetes.io/component: cron
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

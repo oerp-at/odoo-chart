@@ -63,7 +63,7 @@ odoo:
 | [`pvc.yaml`](charts/odooinit/templates/pvc.yaml) | `pre-install` | `-30` | immer; `resource-policy: keep` |
 | [`secret.yaml`](charts/odooinit/templates/secret.yaml) | `pre-install,pre-upgrade` | `-30` | immer |
 | [`restore-job.yaml`](charts/odooinit/templates/restore-job.yaml) | `pre-install` und/oder `pre-upgrade` | `-10` | `restore.enabled` bzw. `restore.onUpdate && !setup` |
-| [`pre-update-scaledown.yaml`](charts/odooinit/templates/pre-update-scaledown.yaml) | `pre-upgrade` | `-13` / `-12` | `scaleDown.enabled && !setup` |
+| [`pre-update-scaledown.yaml`](charts/odooinit/templates/pre-update-scaledown.yaml) | `pre-upgrade` | `-13` (RBAC) / `-12` (Job) | `scaleDown.enabled && !setup` (siehe [Scaledown-Verhalten](#scaledown-verhalten)) |
 | [`pre-update-backup.yaml`](charts/odooinit/templates/pre-update-backup.yaml) | `pre-upgrade` | `-11` | `backup.enabled && !setup` |
 | [`pre-update.yaml`](charts/odooinit/templates/pre-update.yaml) | `pre-upgrade` | `-9` | `update.enabled && !setup` |
 | [`backup-job.yaml`](charts/odooinit/templates/backup-job.yaml) | reguläre `CronJob` | – | `backup.enabled && backup.schedule` |
@@ -127,6 +127,73 @@ Dreistufig:
 - **`readinessProbe`** – Standard-Readiness, entscheidet über Service-Endpoint-Aufnahme.
 
 Defaults siehe [`values.yaml`](values.yaml). Der `startupProbe`-Default toleriert ca. 1 Stunde (`periodSeconds: 30`, `failureThreshold: 120`), damit auch im Safety-Net-Fall – Worker-Pod startet neu, während `ODOO_WAIT_FOR_RESTORE` noch auf einen langen Restore wartet – keine vorzeitige Liveness-Killung erfolgt. Im regulären Install-Flow ist der Marker bereits vor Worker-Start geschrieben und der Probe-Erfolg kommt nach Sekunden.
+
+## Pod-Komponenten-Labels und Service-Routing
+
+Worker- und Cron-Pods sind über das Label `app.kubernetes.io/component` voneinander unterscheidbar. Das ist für korrektes Service-Routing, gezielte Scaledown-Waits und externe Tooling (NetworkPolicy, PodMonitor, eigene Selektoren) wichtig.
+
+| Resource | Selector |
+|---|---|
+| `Deployment <release>-worker` | `name=odoo, instance=<release>, component=worker` |
+| `Deployment <release>-cron` | `name=odoo, instance=<release>, component=cron` |
+| `Service <release>` | `name=odoo, instance=<release>, component=worker` (HTTP nur zu Workern) |
+
+Vorher teilten Worker- und Cron-Deployment denselben Selector – das Service routete jeden n-ten HTTP-Request auf den Cron-Pod (der mit `workers=0` nur einen Single-Threaded-Master-Prozess fährt) und ein per-Komponente-Wait beim Scaledown war nicht möglich.
+
+### Migration
+
+`Deployment.spec.selector` ist in Kubernetes immutable. Beim ersten Upgrade auf Sub-Chart `odoo-19.4.0` / `odooinit-19.7.0` löscht der Scaledown Job (siehe nächster Abschnitt) die Worker- und Cron-Deployments einmalig automatisch (Phase 1 `migrate_selector`); Helm legt sie anschließend mit dem neuen Selector wieder an. Brief Downtime von ungefähr `terminationGracePeriodSeconds` (Default 30s) plus Pod-Startup.
+
+Bei `scaleDown.enabled: false` muss der Operator das manuell vor dem Upgrade ausführen:
+
+```bash
+kubectl delete deployment <release>-worker <release>-cron \
+  -n <namespace> --cascade=foreground --ignore-not-found
+```
+
+Nach dem ersten Upgrade ist der Migrations-Code ein No-Op.
+
+## Scaledown-Verhalten
+
+Der Scaledown-Hook (`pre-upgrade`, Weight `-13`/`-12`) skaliert Worker- und Cron-Deployment vor `backup`/`restore`/`update` Hooks auf 0 und stellt sicher, dass keine Odoo-Prozesse mehr DB-Verbindungen halten.
+
+```mermaid
+sequenceDiagram
+    participant J as Scaledown Job
+    participant K as Kubernetes API
+    Note over J,K: Phase 1 - Selector-Migration (einmalig)
+    J->>K: get deploy <name> -> selector hat 'component'?
+    alt Legacy-Selector
+        J->>K: delete deploy --cascade=foreground
+    end
+    Note over J,K: Phase 2 - skalieren
+    J->>K: scale worker --replicas=0
+    J->>K: scale cron --replicas=0
+    Note over J,K: Phase 3 - rollout-status
+    J->>K: rollout status worker
+    J->>K: rollout status cron
+    Note over J,K: Phase 4 - tatsaechliche Termination
+    J->>K: wait --for=delete pod -l ...,component=worker
+    J->>K: wait --for=delete pod -l ...,component=cron
+```
+
+Konfiguration in [`charts/odooinit/values.yaml`](charts/odooinit/values.yaml):
+
+```yaml
+scaleDown:
+  enabled: true                    # bei false: gar kein Scaledown-Hook
+  timeout: 120                     # Sekunden, gilt fuer JEDE Phase einzeln
+  image:
+    repository: bitnami/kubectl
+    tag: latest
+```
+
+Wichtige Eigenschaften:
+
+- **Timeout pro Phase**: `scaleDown.timeout` wird sowohl an `kubectl rollout status`, `kubectl wait --for=delete` als auch an `kubectl delete --timeout` weitergereicht. Der Job kann also im Worst Case `4 * timeout` Sekunden brauchen.
+- **Per-Komponente-Wait**: dank des `component`-Labels werden Worker- und Cron-Pods getrennt erwartet. Hängt einer der beiden Pods (z. B. wegen langer Cron-Job-Ausführung), bricht der Job mit Exit 1 ab und Helm/Flux brechen das Upgrade kontrolliert ab.
+- **Pipefail aktiv**: das Script aktiviert `set -o pipefail` (sofern die Shell es unterstützt), damit zukünftige Pipeline-Fehler nicht mehr stillschweigend geschluckt werden – das war der Bug, der in Version <= 19.6.0 dazu führte, dass der Scaledown-Wait nie wirklich gewartet hat.
+- **RBAC**: der Hook erstellt einen `ServiceAccount`, eine `Role` mit `apps/deployments` (get/list/watch/patch/**delete**) und `pods` (get/list/watch), sowie ein `RoleBinding`. Das sind die minimal notwendigen Rechte für die vier Phasen.
 
 ## TLS via cert-manager und Ingress
 
