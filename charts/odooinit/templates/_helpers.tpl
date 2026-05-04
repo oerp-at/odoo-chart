@@ -156,6 +156,15 @@ log_handler = [':INFO']
 log_level = info
 data_dir = /data
 workers = {{ .Values.workers }}
+{{- /*
+  Module selection for the worker pod.
+  - queue_job is loaded here only in single-process mode (workers == 0),
+    because then the worker pod also runs cron threads. When workers > 0
+    a dedicated cron pod runs (see deployment-cron.yaml) and queue_job
+    is enabled there exclusively (see odoo-cron.config above).
+  - session_db is loaded regardless of worker mode because every pod
+    that serves HTTP requests needs access to the shared session store.
+*/}}
 {{- $modules := list "web" }}
 {{- if gt (int .Values.workers) 0 }}
 max_cron_threads = {{ .Values.cronWorkers }}
