@@ -126,8 +126,11 @@ log_level = info
 data_dir = /data
 workers = 0
 max_cron_threads = {{ .Values.cronThreads }}
-{{- if .Values.queue }}
-server_wide_modules = web,queue_job
+{{- $modules := list "web" }}
+{{- if .Values.queue }}{{- $modules = append $modules "queue_job" }}{{- end }}
+{{- if .Values.sessionstore.db }}{{- $modules = append $modules "session_db" }}{{- end }}
+{{- if gt (len $modules) 1 }}
+server_wide_modules = {{ join "," $modules }}
 {{- end }}
 limit_time_real_cron = 0
 limit_time_real = 0
@@ -153,6 +156,7 @@ log_handler = [':INFO']
 log_level = info
 data_dir = /data
 workers = {{ .Values.workers }}
+{{- $modules := list "web" }}
 {{- if gt (int .Values.workers) 0 }}
 max_cron_threads = {{ .Values.cronWorkers }}
 limit_time_real_cron = 0
@@ -162,9 +166,11 @@ limit_time_real_cron = 0
 limit_time_real = 0
 limit_memory_soft = 0
 limit_memory_hard = 0
-{{- if .Values.queue }}
-server_wide_modules = web,queue_job
+{{- if .Values.queue }}{{- $modules = append $modules "queue_job" }}{{- end }}
 {{- end }}
+{{- if .Values.sessionstore.db }}{{- $modules = append $modules "session_db" }}{{- end }}
+{{- if gt (len $modules) 1 }}
+server_wide_modules = {{ join "," $modules }}
 {{- end }}
 {{ include "odoo.addConfig" . }}
 {{- end }}
