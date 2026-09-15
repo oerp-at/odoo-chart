@@ -1,0 +1,273 @@
+{{/*
+Reload Job (odoo.sh "reload from production").
+
+Renders a CronJob plus its own ServiceAccount/Role/RoleBinding when
+reload.enabled is true. One pod, three steps, so the order is guaranteed:
+
+  1. initContainer `scaledown`  remember the current replica counts,
+                                scale worker and cron to 0, wait for the
+                                pods to be gone (no lingering DB connections)
+  2. initContainer `restore`    restore database and filestore, optionally
+                                neutralize, then run the module update
+  3. container     `scaleup`    scale both Deployments back to the
+                                remembered counts
+
+An empty reload.schedule renders the never-matching schedule "0 0 31 2 *"
+and suspends the job: it exists but only a manual trigger runs it:
+
+  kubectl -n <ns> create job --from=cronjob/<release>-reload reload-manual
+
+If the restore step fails the `scaleup` container never runs and the
+instance stays down on purpose - a half restored instance must not serve
+requests. The kubectl image and the per-phase timeout are shared with
+scaleDown.image/scaleDown.timeout, independent of scaleDown.enabled.
+
+Unlike the restore hook this job always passes --force-drop-db: dropdb
+aborts on any remaining connection, and an unattended reload must not die
+on a forgotten session.
+*/}}
+{{- if and .Values.reload.enabled (not .Values.setup) -}}
+{{- $dbPath := .Values.reload.databasePath | default .Values.restore.databasePath -}}
+{{- $fsPath := .Values.reload.filestorePath | default .Values.restore.filestorePath -}}
+{{- $install := .Values.reload.installModule | default .Values.restore.installModule -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "odoo.fullname" . }}-reload
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "odoo.fullname" . }}-reload
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+rules:
+  # scale worker/cron down and up again; no delete - the selector
+  # migration is the upgrade hook's job, not the reload's
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch"]
+  # required for `kubectl wait --for=delete pod`
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "odoo.fullname" . }}-reload
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "odoo.fullname" . }}-reload
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "odoo.fullname" . }}-reload
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "odoo.fullname" . }}-reload
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+spec:
+  # an empty schedule never fires ("February 31st"), the job is suspended
+  # as well and is meant to be triggered manually
+  schedule: {{ .Values.reload.schedule | default "0 0 31 2 *" | quote }}
+  suspend: {{ if .Values.reload.schedule }}{{ .Values.reload.suspend }}{{ else }}true{{ end }}
+  {{- if .Values.reload.timezone }}
+  timeZone: "{{ .Values.reload.timezone }}"
+  {{- end }}
+  concurrencyPolicy: Forbid
+  {{- with .Values.reload.startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ . }}
+  {{- end }}
+  successfulJobsHistoryLimit: {{ .Values.reload.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.reload.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      {{- with .Values.reload.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      ttlSecondsAfterFinished: {{ .Values.reload.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "odoo.labels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "odoo.fullname" . }}-reload
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          initContainers:
+            - name: scaledown
+              image: "{{ .Values.scaleDown.image.repository }}:{{ .Values.scaleDown.image.tag }}"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  ( set -o pipefail ) 2>/dev/null && set -o pipefail || true
+
+                  NS="{{ .Release.Namespace }}"
+                  TIMEOUT="{{ .Values.scaleDown.timeout }}"
+                  MIN_REPLICAS="{{ .Values.reload.minReplicas }}"
+                  FULLNAME="{{ include "odoo.fullname" . }}"
+                  SELECTOR_BASE="app.kubernetes.io/name=odoo,app.kubernetes.io/instance={{ .Release.Name }}"
+
+                  down() {
+                    DEPLOY="$1"
+                    COMPONENT="$2"
+                    if ! kubectl get deployment "$DEPLOY" -n "$NS" >/dev/null 2>&1; then
+                      echo "Deployment $DEPLOY not found - skipping."
+                      return 0
+                    fi
+
+                    # Remember the current size for the scaleup step. A zero is
+                    # never remembered: a previously failed reload would keep the
+                    # instance down forever.
+                    CURRENT=$(kubectl get deployment "$DEPLOY" -n "$NS" \
+                      -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+                    if [ -z "$CURRENT" ] || [ "$CURRENT" = "0" ]; then
+                      CURRENT="$MIN_REPLICAS"
+                    fi
+                    echo "$CURRENT" > "/state/replicas-${COMPONENT}"
+                    echo "Remembered $DEPLOY at $CURRENT replica(s)."
+
+                    echo "Scaling $DEPLOY to 0 ..."
+                    kubectl scale deployment "$DEPLOY" --replicas=0 -n "$NS"
+                    kubectl rollout status deployment "$DEPLOY" -n "$NS" \
+                      --timeout="${TIMEOUT}s"
+
+                    SELECTOR="${SELECTOR_BASE},app.kubernetes.io/component=${COMPONENT}"
+                    echo "Waiting for ${COMPONENT} pods to terminate ..."
+                    if ! kubectl wait --for=delete pod -l "$SELECTOR" -n "$NS" \
+                        --timeout="${TIMEOUT}s"; then
+                      REMAINING=$(kubectl get pods -n "$NS" -l "$SELECTOR" \
+                        --no-headers 2>/dev/null | wc -l)
+                      echo "Timeout: $REMAINING ${COMPONENT} pod(s) still present after ${TIMEOUT}s." >&2
+                      exit 1
+                    fi
+                  }
+
+                  down "${FULLNAME}-worker" worker
+                  down "${FULLNAME}-cron" cron
+                  echo "Scale-down complete."
+              volumeMounts:
+                - name: {{ include "odoo.fullname" . }}-reload-state-vol
+                  mountPath: /state
+            - name: restore
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              args:
+              - restore
+              {{- if $fsPath }}
+              - "--restore-fs={{ $fsPath }}"
+              {{- end }}
+              {{- if $dbPath }}
+              - "--restore-db={{ $dbPath }}"
+              {{- end }}
+              {{- if $install }}
+              - "--install={{ $install }}"
+              {{- end }}
+              {{- if .Values.reload.neutralize }}
+              - "--neutralize"
+              {{- end }}
+              - "--force-drop-db"
+              {{- if .Values.reload.update }}
+              - "--update"
+              {{- end }}
+              volumeMounts:
+                - name: {{ include "odoo.fullname" . }}-config-vol
+                  mountPath: /data/etc
+                  readOnly: true
+                {{- if not .Values.sessionstore.db }}
+                - name: {{ include "odoo.fullname" . }}-session-vol
+                  mountPath: /data/sessions
+                {{- end }}
+                - name: {{ include "odoo.fullname" . }}-filestore-vol
+                  mountPath: /data/filestore
+                {{- if .Values.backup.volumeClaim }}
+                - name: {{ include "odoo.fullname" . }}-backup-vol
+                  mountPath: /data/backup
+                {{- end }}
+                {{- with .Values.volumeMounts }}
+                  {{- toYaml . | nindent 16 }}
+                {{- end }}
+              envFrom:
+                - secretRef:
+                    name: "{{ include "odoo.fullname" . }}-postgres-config"
+                - secretRef:
+                    name: "{{ include "odoo.fullname" . }}-postgres-admin-config"
+          containers:
+            - name: scaleup
+              image: "{{ .Values.scaleDown.image.repository }}:{{ .Values.scaleDown.image.tag }}"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  NS="{{ .Release.Namespace }}"
+                  TIMEOUT="{{ .Values.scaleDown.timeout }}"
+                  MIN_REPLICAS="{{ .Values.reload.minReplicas }}"
+                  FULLNAME="{{ include "odoo.fullname" . }}"
+
+                  up() {
+                    DEPLOY="$1"
+                    COMPONENT="$2"
+                    if ! kubectl get deployment "$DEPLOY" -n "$NS" >/dev/null 2>&1; then
+                      echo "Deployment $DEPLOY not found - skipping."
+                      return 0
+                    fi
+                    TARGET=$(cat "/state/replicas-${COMPONENT}" 2>/dev/null || true)
+                    if [ -z "$TARGET" ] || [ "$TARGET" = "0" ]; then
+                      TARGET="$MIN_REPLICAS"
+                    fi
+                    echo "Scaling $DEPLOY back to $TARGET ..."
+                    kubectl scale deployment "$DEPLOY" --replicas="$TARGET" -n "$NS"
+                    kubectl rollout status deployment "$DEPLOY" -n "$NS" \
+                      --timeout="${TIMEOUT}s"
+                  }
+
+                  up "${FULLNAME}-worker" worker
+                  up "${FULLNAME}-cron" cron
+                  echo "Reload complete."
+              volumeMounts:
+                - name: {{ include "odoo.fullname" . }}-reload-state-vol
+                  mountPath: /state
+          volumes:
+            - name: {{ include "odoo.fullname" . }}-reload-state-vol
+              emptyDir: {}
+            - name: {{ include "odoo.fullname" . }}-config-vol
+              secret:
+                secretName: {{ include "odoo.fullname" . }}-config
+            {{- if not .Values.sessionstore.db }}
+            - name: {{ include "odoo.fullname" . }}-session-vol
+              persistentVolumeClaim:
+                claimName: {{ include "odoo.fullname" . }}-sessionstore
+            {{- end }}
+            - name: {{ include "odoo.fullname" . }}-filestore-vol
+              persistentVolumeClaim:
+                claimName: {{ include "odoo.fullname" . }}-filestore
+            {{- if .Values.backup.volumeClaim }}
+            - name: {{ include "odoo.fullname" . }}-backup-vol
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.volumeClaim }}
+            {{- end }}
+          {{- with .Values.volumes }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

@@ -48,6 +48,44 @@ restore:
   neutralize: false
   activeDeadlineSeconds: 7200
 
+# reload: restore an existing instance again (odoo.sh "reload from
+# production"). Scales worker and cron down, restores, scales back up.
+reload:
+  # render the CronJob at all
+  enabled: false
+
+  # cron expression. Empty renders the never-matching schedule "0 0 31 2 *"
+  # and suspends the job: it exists, but only a manual trigger runs it
+  #   kubectl -n <ns> create job --from=cronjob/<release>-reload reload-manual
+  schedule: ""
+  # IANA timezone for the schedule; empty means UTC
+  timezone: ""
+  # arm/disarm an existing schedule without removing the job
+  suspend: false
+
+  # data source; empty falls back to restore.databasePath/restore.filestorePath
+  databasePath: ""
+  filestorePath: ""
+
+  # defuse the reloaded copy (mail servers, crons, webhooks, uuid/secret)
+  neutralize: true
+  # install these modules while reloading; empty falls back to
+  # restore.installModule
+  installModule: ""
+  # run the module update after the restore
+  update: true
+
+  # replicas to scale back up to when the Deployment was already at 0
+  minReplicas: 1
+
+  # limits. The kubectl image and the per-phase timeout come from
+  # scaleDown.image/scaleDown.timeout.
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
 # backup
 backup:
   enabled: false

@@ -67,6 +67,7 @@ odoo:
 | [`pre-update-backup.yaml`](charts/odooinit/templates/pre-update-backup.yaml) | `pre-upgrade` | `-11` | `backup.enabled && !setup` |
 | [`pre-update.yaml`](charts/odooinit/templates/pre-update.yaml) | `pre-upgrade` | `-9` | `update.enabled && !setup` |
 | [`backup-job.yaml`](charts/odooinit/templates/backup-job.yaml) | reguläre `CronJob` | – | `backup.enabled && backup.schedule` |
+| [`reload-job.yaml`](charts/odooinit/templates/reload-job.yaml) | reguläre `CronJob` + eigenes RBAC | – | `reload.enabled && !setup` (siehe [Auffrischen](#auffrischen-reload)) |
 
 ## Lifecycle-Reihenfolge
 
@@ -152,6 +153,62 @@ odoo:
     backup:
       volumeClaim: odoo-prod-backup      # RWX-PVC der Produktion, nur lesend genutzt
 ```
+
+## Auffrischen (`reload`)
+
+`restore.onUpdate` ist an ein Helm-Upgrade gebunden: es frischt bei *jedem* Ausrollen auf, auch wenn nur ein neues Abbild kommt. Für „Daten beim Erstinit holen, danach auf Zuruf auffrischen" gibt es `reload`. Das entspricht dem „Reload from production" von odoo.sh.
+
+`reload.enabled: true` rendert einen `CronJob` mit eigenem `ServiceAccount`/`Role`/`RoleBinding` – die RBAC des Scaledown-Hooks ist selbst ein Hook und wird nach dem Upgrade gelöscht, ein CronJob kann sie nicht mitbenutzen. Ein Pod, drei Schritte, damit die Reihenfolge garantiert ist:
+
+1. initContainer `scaledown` (kubectl-Abbild) – merkt die aktuellen `replicas` von Worker und Cron in einem `emptyDir`, skaliert beide auf 0 und wartet, bis die Pods wirklich weg sind. Eine gemerkte 0 wird nie übernommen, sonst hält ein zuvor fehlgeschlagener Lauf die Instanz dauerhaft unten (`reload.minReplicas` als Untergrenze).
+2. initContainer `restore` (odoo-Abbild, gleiche Mounts und Secrets wie der Einspiel-Hook) – `restore [--restore-fs=] [--restore-db=] [--install=] [--neutralize] --force-drop-db [--update]`.
+3. Container `scaleup` (kubectl-Abbild) – schreibt die gemerkten Werte zurück.
+
+### Nur von Hand auslösen
+
+Ein `CronJob` braucht laut API einen Zeitplan. Ist `reload.schedule` leer, rendert das Chart den nie zutreffenden Ausdruck `0 0 31 2 *` **und** setzt `suspend: true`. Der Auftrag existiert dann nur als Vorlage:
+
+```bash
+kubectl -n <namespace> create job --from=cronjob/<release>-reload reload-$(date +%Y%m%d-%H%M)
+kubectl -n <namespace> logs -f job/reload-…            # scaledown -> restore -> scaleup
+```
+
+`--from` funktioniert auch bei stillgelegtem Zeitplan. `reload.suspend` legt umgekehrt einen vorhandenen Zeitplan zeitweise still, ohne ihn zu löschen.
+
+### Was bewusst kein Schalter ist
+
+- **`--force-drop-db` setzt der Auftrag immer.** `dropdb` läuft mit `check=True` und bricht an jeder offenen Verbindung ab. Das Herunterfahren erwischt die Odoo-Pods, aber keine vergessene `psql`-Sitzung – ein unbeaufsichtigter Lauf darf daran nicht sterben.
+- **kubectl-Abbild und Phasen-Zeitlimit** kommen aus `scaleDown.image` und `scaleDown.timeout`, unabhängig von `scaleDown.enabled` (das steuert nur den Upgrade-Hook). Keine zweite Stelle zum Pflegen.
+- **Kein `--wait-for-data`.** Fehlt der Abzug, soll der Lauf scheitern und nicht stundenlang warten.
+
+### Betriebsverhalten
+
+- ⚠️ **Scheitert das Einspielen, bleibt die Instanz unten** – der `scaleup`-Container läuft dann nie. Das ist beabsichtigt: eine halb eingespielte Instanz soll nicht bedienen. Ein `trap` zum Hochfahren ist nicht möglich, weil kubectl und odoo verschiedene Abbilder sind.
+- ⚠️ **`driftDetection` an der `HelmRelease` muss aus bleiben** (Flux-Default). Mit aktivierter Drift-Erkennung dreht Flux das `replicas=0` mitten im Einspielen zurück. Die HelmReleases liegen im Namensraum `flux-system`, nicht im App-Namensraum.
+- ⚠️ **`autoscaling.enabled` muss `false` sein.** Ein HPA mit `minReplicas >= 1` schiebt gegen das Herunterfahren an.
+- **Zeitplan rechnet UTC**, solange `reload.timezone` leer ist. Wer aus der Sicherung einer anderen Release liest, muss genug Abstand zu deren Sicherungslauf halten – sonst liest der Auftrag in eine halb geschriebene `db.dump.gz`. Die Kopien in `.backlog/` sind immer vollständig, tragen aber einen Zeitstempel im Namen und sind damit nicht statisch adressierbar.
+- Der Auftrag ist `concurrencyPolicy: Forbid`; zwei Läufe können sich nicht überlappen.
+
+### Beispiel: Staging, das beim Erstinit einspielt und danach auf Zuruf auffrischt
+
+```yaml
+# odooi/values.yaml der Staging-Release
+odoo:
+  odooinit:
+    restore:
+      enabled: true            # Erstinit holt die Daten
+      onUpdate: false          # spätere Upgrades lassen sie in Ruhe
+      neutralize: true
+      databasePath: /data/backup/db.dump.gz
+      filestorePath: /data/backup/filestore
+    backup:
+      volumeClaim: odoo-prod-backup   # RWX-PVC der Produktion, nur gelesen
+    reload:
+      enabled: true            # Auftrag anlegen
+      schedule: ""             # aber nicht scharf: nur manuell
+```
+
+`reload` erbt `databasePath`, `filestorePath` und `installModule` aus `restore.*`, wenn die eigenen Werte leer sind – die Pfade stehen also nur einmal.
 
 ## Probes
 
