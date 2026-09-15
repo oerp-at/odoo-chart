@@ -41,6 +41,11 @@ restore:
   installModule: ""
   filestorePath: ""
   databasePath: ""
+  # neutralize the restored database: disables mail servers (an additional
+  # dummy server blocks the odoo.conf smtp fallback), crons, webhooks and
+  # resets database.uuid/secret. Only effective when a database dump was
+  # actually restored, and applied before the module update.
+  neutralize: false
   activeDeadlineSeconds: 7200
 
 # backup

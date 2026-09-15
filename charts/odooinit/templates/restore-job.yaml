@@ -9,6 +9,10 @@ Restore Job. Runs as:
     back the database/filestore from the configured source before the
     update Job runs.
 
+With restore.neutralize the restored copy is defused (mail servers, crons,
+webhooks, database.uuid/secret) before the module update runs. The flag is
+a no-op when no database dump was restored.
+
 PVCs and Secrets are themselves pre-install/pre-upgrade hooks at weight -30
 so they are guaranteed to exist when this Job runs.
 */}}
@@ -68,6 +72,9 @@ spec:
           {{- end }}
           {{- if .Values.restore.installModule }}
           - "--install={{ .Values.restore.installModule }}"
+          {{- end }}
+          {{- if .Values.restore.neutralize }}
+          - "--neutralize"
           {{- end }}
           - "--update"
           - "--wait-for-data"
