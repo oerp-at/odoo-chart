@@ -112,11 +112,46 @@ Gesteuert über `odooinit.restore.*`:
 | `enabled: true`, keine Pfade | Frisches DB-Init via `odoo serve --stop-after-init`, Marker geschrieben. Geeignet für leere Erstinstallation. |
 | `enabled: true`, `databasePath` und/oder `filestorePath` | Restore aus dem angegebenen Pfad (lokal oder `kube://`-URL) vor dem ersten Worker-Start. |
 | `onUpdate: true` | Bei jedem Upgrade wird zusätzlich vor dem Update-Job restored (z. B. um die Produktiv-DB in Staging zu spiegeln). |
+| `neutralize: true` | Die eingespielte Kopie wird entschärft, bevor der Update-Job läuft – siehe [Entschärfen](#entschärfen-neutralize). Wirkt nur, wenn ein Datenbankabzug eingespielt wurde. |
 | `enabled: false`, `onUpdate: false` | Restore-Job wird nicht gerendert. Nutzer ist selbst verantwortlich für DB-Bootstrapping. |
 
 Der Worker liest beim Start den Marker `/data/filestore/<db>/restored`. Solange dieser fehlt und `ODOO_WAIT_FOR_RESTORE=1` gesetzt ist, blockiert `serve.py` (siehe [`addons-oerp/oerp_util/patch/odoo/cli/serve.py`](../../../../../addons-oerp/oerp_util/patch/odoo/cli/serve.py)). Im neuen Hook-Flow ist der Marker bereits geschrieben, bevor der Worker startet – die Wait-Loop ist Safety-Net für Race-Conditions und für Setups mit langsam mountendem Filestore.
 
 Die Restore-Dauer ist stark variabel und kann bei großen Datenbanken oder Filestores **bis zu einer Stunde oder länger** dauern. Die Job-Laufzeit ist über `restore.activeDeadlineSeconds` begrenzt (Default 2h), und Flux/Helm-Timeouts müssen entsprechend dimensioniert sein – siehe Abschnitt [Restore-Dauer und Timeouts](#restore-dauer-und-timeouts).
+
+### Entschärfen (`neutralize`)
+
+`restore.neutralize: true` hängt `--neutralize` an den Einspiel-Auftrag. Die erweiterte CLI führt damit `odoo.modules.neutralize.neutralize_database()` aus – reines SQL je installiertem Modul (`<modul>/data/neutralize.sql`), kein ORM – und setzt zusätzlich `database.uuid` sowie das Anlagedatum neu und entfernt die Enterprise-Schlüssel.
+
+Was danach tot ist:
+
+- **Mailversand.** Alle `ir_mail_server` inaktiv *und* ein Dummy-Server (`smtp_host='invalid'`, Port 1025) angelegt. Der Dummy ist der eigentliche Trick: ohne ihn greift der Fallback aus der `odoo.conf` (`add_config_smtp_server`) weiter.
+- **Geplante Aktionen.** Alle `ir_cron` ausser `base.autovacuum_job` inaktiv.
+- **Webhooks.** `ir_act_server.webhook_url` entwertet.
+- **`database.secret`** auf einen Dummy, damit signierte Tokens der Produktion nicht mehr gelten.
+
+Vier Dinge, die man dabei wissen muss:
+
+1. **Der Schalter wirkt nur mit Datenbankabzug.** Entschärft wird im Zweig `if self.db_dump:`; beim Erstinit ohne `databasePath` ist `--neutralize` ein No-Op. Für Staging heisst das: der Schalter ergibt nur zusammen mit `databasePath` (und meist `onUpdate: true`) Sinn.
+2. ⚠️ **Entschärft wird VOR dem Update.** Reihenfolge im Auftrag ist einspielen → entschärfen → `--update`. Ein `-u all` schreibt Moduldaten neu, und Cron-Datensätze, die mit explizitem `active=True` und ohne `noupdate` ausgeliefert werden, sind danach **wieder aktiv**. Im Kern betrifft das `account_peppol_response`, `base_vat`, `data_recycle`, `event_crm` und `website`. Wer garantiert keine geplanten Aktionen will, muss sie nach dem Update noch einmal abräumen.
+3. **Einmaligkeit.** `neutralize.sql` setzt `database.is_neutralized`; ein zweiter Lauf auf derselben DB wird mit einer Warnung übersprungen. Bei jeder Auffrischung aus der Produktion ist der Abzug aber wieder scharf, der Schalter also weiterhin nötig.
+4. **`--development` ist bewusst nicht durchgereicht.** Es setzt uid 2 auf `admin`/`admin`, schaltet MFA ab und deaktiviert alle Crons – das gehört auf eine lokale Kopie, nicht auf eine öffentlich erreichbare Staging-Instanz.
+
+Beispiel Staging, das jede Nacht aus der Sicherung der Produktion auffrischt:
+
+```yaml
+# odooi/values.yaml der Staging-Release
+odoo:
+  odooinit:
+    restore:
+      enabled: true
+      onUpdate: true
+      neutralize: true
+      databasePath: /data/backup/db.dump.gz
+      filestorePath: /data/backup/filestore
+    backup:
+      volumeClaim: odoo-prod-backup      # RWX-PVC der Produktion, nur lesend genutzt
+```
 
 ## Probes
 
@@ -351,11 +386,25 @@ spec:
 
 `disableWait` ist bewusst nicht gesetzt – das ursprüngliche Deadlock zwischen `--wait` und `post-install` Restore wurde durch die Verlagerung des Restores in einen `pre-install` Hook beseitigt. Stattdessen ist nur ein ausreichend großzügiges `timeout` notwendig, siehe Abschnitt [Restore-Dauer und Timeouts](#restore-dauer-und-timeouts).
 
-## Patch-Source-Hinweis
+## Herkunft des Sub-Charts
 
-Das identische Sub-Chart wird beim Anlegen neuer Subprojekte aus [`addons-oerp/oerp_util/patch/kubernetes/charts/odoo/`](../../../../addons-oerp/oerp_util/patch/kubernetes/charts/odoo/) per `patch.py` einmalig kopiert (Modus `copy_tree`). Es findet **kein automatischer Sync** statt. Verbesserungen am Sub-Chart `charts/odoo` müssen daher zusätzlich in der Patch-Source gespiegelt werden, sonst übernehmen neue Subprojekte den alten Stand.
+Dieses Sub-Chart ist ein **git-Subtree** aus [`oerp-at/odoo-chart`](https://github.com/oerp-at/odoo-chart), Zweig `19.0`:
 
-Das Wrapper-Chart `charts/odooi` wird hingegen pro Instanz neu angelegt und nicht aus der Patch-Source gespeist.
+```
+git-subtree-dir:   charts/odooi/charts/odoo
+remote odoo-chart  git@github.com:oerp-at/odoo-chart.git
+```
+
+Änderungen am Sub-Chart gehören deshalb **nach oben zurück**, sonst bekommt sie keine andere Instanz:
+
+```bash
+git subtree push --prefix=charts/odooi/charts/odoo odoo-chart 19.0
+git subtree pull --prefix=charts/odooi/charts/odoo odoo-chart 19.0   # in den anderen Checkouts
+```
+
+⚠️ Es gibt **keinen** automatischen Sync – weder zwischen den Kunden-Checkouts noch in Richtung Patch-Source.
+
+Die Patch-Source [`addons-oerp/oerp_util/patch/charts/odooi/`](../../../../addons-oerp/oerp_util/patch/charts/odooi/) enthält nur noch das **Wrapper-Chart** (`Chart.yaml` + leere `values.yaml`); das Sub-Chart `odoo` liegt dort nicht mehr. Ältere Ständen dieser Datei verwiesen auf `patch/kubernetes/charts/odoo/` – dieser Pfad existiert nicht mehr.
 
 ## Konventionen für Anpassungen
 
