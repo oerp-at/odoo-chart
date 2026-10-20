@@ -31,6 +31,20 @@ update:
   enabled: true
   backoffLimit: 0
 
+# migration to the next major version: the update job finds a database of the
+# previous major version and migrates it in place (odoo update, see
+# addons-oerp/upgrade/README.md). Empty = default of the image (auto).
+upgrade:
+  # auto: Community with our scripts (addons-oerp/upgrade), Enterprise with
+  # subscription code via upgrade.odoo.com (our scripts if Odoo refuses);
+  # odoo: always upgrade.odoo.com; oerp: always our scripts
+  source: ""
+  # request type on upgrade.odoo.com. auto: test for a neutralized database,
+  # production otherwise; test; production
+  aim: ""
+  # additional upgrade script directories in the image, comma separated
+  extraPath: ""
+
 # restore
 # activeDeadlineSeconds caps the restore Job runtime. Default 7200 (2h)
 # leaves a generous buffer for very large databases. Tune per instance

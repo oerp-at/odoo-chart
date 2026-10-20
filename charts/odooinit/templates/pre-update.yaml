@@ -51,6 +51,24 @@ spec:
           envFrom:
             - secretRef:
                 name: "{{ include "odoo.fullname" . }}-postgres-config"
+          {{- with .Values.upgrade }}
+          {{- if or .source .aim .extraPath }}
+          # odoo update migrates a database of the previous major version in place
+          env:
+            {{- if .source }}
+            - name: ODOO_UPGRADE_SOURCE
+              value: {{ .source | quote }}
+            {{- end }}
+            {{- if .aim }}
+            - name: ODOO_UPGRADE_AIM
+              value: {{ .aim | quote }}
+            {{- end }}
+            {{- if .extraPath }}
+            - name: ODOO_EXTRA_UPGRADE_PATH
+              value: {{ .extraPath | quote }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
       volumes:
         - name: {{ include "odoo.fullname" . }}-config-vol
           secret:

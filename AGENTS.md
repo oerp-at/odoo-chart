@@ -364,6 +364,28 @@ certmanager:
   issuerKind: "Issuer"
 ```
 
+## Hauptversion migrieren (`upgrade`)
+
+Kommt ein Abbild der nächsten Hauptversion (z. B. 20.0) auf eine Datenbank der vorigen (19.0), migriert der Update-Job sie selbst: `odoo update` ruft dann `odoo migrate --in-place` auf. Scaledown und Pre-Update-Backup laufen vorher wie bei jedem Upgrade. Die Werte gehen als Umgebungsvariablen in den Update-Job (`ODOO_UPGRADE_SOURCE`, `ODOO_UPGRADE_AIM`, `ODOO_EXTRA_UPGRADE_PATH`), leer = Vorgabe des Abbilds:
+
+| Wert | Vorgabe | Bedeutung |
+|---|---|---|
+| `upgrade.source` | `auto` | `auto`: Community mit unseren Skripten (addons-oerp/upgrade), Enterprise mit Abo-Code über upgrade.odoo.com, lehnt Odoo ab → unsere Skripte. `odoo`: immer Odoo. `oerp`: immer unsere Skripte |
+| `upgrade.aim` | `auto` | Anfrageart bei Odoo. `auto`: neutralisierte DB → `test`, sonst `production` |
+| `upgrade.extraPath` | leer | zusätzliche Skriptverzeichnisse im Abbild, durch Komma getrennt |
+
+```yaml
+odoo:
+  odooinit:
+    upgrade:
+      source: oerp           # z. B. Enterprise, deren Skripte wir selbst pflegen
+```
+
+- ⚠️ Mit `odoo` geht ein Dump der Datenbank an Odoo. Das Hochladen, die Migration bei Odoo und das Einspielen dauern oft Stunden: Flux-`timeout` entsprechend setzen (siehe unten).
+- Ein neu gestarteter Update-Job setzt eine laufende Odoo-Anfrage fort (Token im Filestore-Volume unter `.odoo-upgrade/<db>`), er schickt die Datenbank nicht noch einmal.
+- Schlägt die Migration fehl, scheitert der Job und damit das Helm-Upgrade. Lehnt Odoo die Anfrage bei `source: odoo` ab oder bricht die Migration bei Odoo ab, bleibt die Datenbank unverändert auf der alten Version. Scheitert ein späterer Schritt, steht der Marker `oerp.migration.state` auf `failed` und `odoo serve` verweigert die Datenbank: dann das Pre-Update-Backup einspielen.
+- Staging mit `restore.onUpdate` + `neutralize`: die eingespielte Produktiv-Kopie ist neutralisiert, geht also als `test`-Anfrage an Odoo.
+
 ## Restore-Dauer und Timeouts
 
 Ein Restore kann je nach Datenbankgröße, Filestore-Volumen und Storage-Backend-Geschwindigkeit **bis zu einer Stunde oder länger** dauern. Drei Stellen sind davon betroffen und müssen aufeinander abgestimmt sein:
